@@ -1,1 +1,295 @@
+/*
+MotorControls.ino - Arduino Nano
+This code runs on the Arduino Nano (I2C Slave) and controls the stepper motor 
+for rotating the platform and the DC motors for dispensing cards, based on 
+configuration received from the Arduino Uno (I2C Master).
 
+Key Logic:
+1. I2C receiveEvent() reads peopleCount and gameMode.
+2. The selected game function (e.g., gameUno) executes the dispensing sequence.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+//defining pin names to pin numbers
+#define stepPin         A2
+#define dirPin          A1
+#define DCM1_PWM_Pin    9
+#define DCM2_PWM_Pin    10
+#define DCM3_PWM_Pin    11
+#define DCM1_FWD_Pin    5
+#define DCM2_FWD_Pin    7
+#define DCM3_FWD_Pin    8
+#define MS3_Pin         4
+#define MS2_Pin         12
+#define MS1_Pin         6
+#define SDA             A4
+#define SCL             A5
+
+//=================================================================
+//Global State Management
+//=================================================================
+enum AppState {
+    SET_UP_STARTUP,      // Initial setup phase after receiving config
+    SETUP_UNO,           // UNO dispensing sequence
+    SETUP_BlackJack,     // BlackJack dispensing sequence
+    SETUP_HoldEm,        // Texas Hold'em dispensing sequence
+    DISPENSE_OVER        // Halt state
+};
+AppState currentState = SET_UP_STARTUP;
+
+//-------------------------------------------------------------------------
+//Global Variables
+//-------------------------------------------------------------------------
+//I2C Communication Variables
+volatile byte peopleCount = 0;
+volatile byte gameMode = 0;
+//sets up nema17
+const int slaveAddress = 0x09;
+unsigned long stepsTotal;
+//sets up DC Motors
+float lengthOfCard = 130.3; //Size is in mm
+float radiusMain = 31.75;  
+float radiusSecond = 12.7;
+int DCM_Spd = 100;          //rpm
+int DCM_PWM_Spd = 0;
+float msActiveMain = 0;     //Amount of time in ms the motor should be powered to push out 1 card, set in setup function
+float msActiveSecond = 0;   //Amount of time in ms the motor should be powered to push out 1 card from the end of the Dispenser, set in setup function
+//Timing variables to change as desired
+int rpm = 9;                //variable to change if you want a higher or lower rpm
+int scalingFactor = 16;     //variable to change if you want a higher or lower scaling factor. Set to 16 for smoothness, can change to 8,4,2,1
+unsigned long stepDelay = (1000000L/((long)rpm*200*2*scalingFactor/60));
+//Card Dispensing Variables
+int cardCount = 0;          //Number of cards to be dispensed per person, set in gameModeSelected function
+int cardDispense = 0;       //Number of cards to be dispensed per rotation, set in gameModeSelected function
+bool clockwise = true;    //Sets direction platform rotates, Low = clockwise for left->right, High = cc for right->left
+bool dispenseInProgress = false; //Flag to indicate if dispensing is in progress
+
+//-------------------------------------------------------------------------
+//Function Declarations
+//-------------------------------------------------------------------------
+void moveStepMotor();
+void stepsPerPerson(int peopleCount);
+void receiveEvent(int numBytes);
+void spitCard();
+void setScalingFactor(int scalingFactor);
+void gameModeSelected();
+void gameUno();
+void gameBlackJack();
+void gameHoldEm();
+
+//-------------------------------------------------------------------------
+//Setup
+//-------------------------------------------------------------------------
+void setup(){
+//Sets global variables
+    DCM_PWM_Spd = map(DCM_Spd, 0, 200, 0, 255);
+    msActiveMain = (unsigned long) (((lengthOfCard / (2.0 * M_PI * radiusMain)) / ((float)DCM_PWM_Spd / 60.0)) * 1000.0);
+    msActiveSecond = (unsigned long) (((lengthOfCard / (2.0 * M_PI * radiusSecond)) / ((float)DCM_PWM_Spd / 60.0)) * 1000.0) - msActiveMain;
+    Wire.begin(slaveAddress);
+    Wire.onReceive(receiveEvent);
+    Serial.begin(9600);
+//Sets pin mode
+    pinMode(stepPin, OUTPUT);
+    pinMode(dirPin, OUTPUT);
+    pinMode(DCM1_PWM_Pin, OUTPUT);
+    pinMode(DCM2_PWM_Pin, OUTPUT);
+    pinMode(DCM3_PWM_Pin, OUTPUT);
+    pinMode(DCM1_FWD_Pin, OUTPUT);
+    pinMode(DCM2_FWD_Pin, OUTPUT);
+    pinMode(DCM3_FWD_Pin, OUTPUT);
+    pinMode(MS1_Pin, OUTPUT);
+    pinMode(MS2_Pin, OUTPUT);
+    pinMode(MS3_Pin, OUTPUT);
+    delay(2000);
+
+}
+
+//-------------------------------------------------------------------------
+//Main Logic
+//-------------------------------------------------------------------------
+//Rotates Card Dispenser and dispenses cards
+void loop(){
+    switch (currentState){
+        case SET_UP_STARTUP:
+            stepsPerPerson(peopleCount);
+            setScalingFactor(scalingFactor);
+            gameModeSelected();
+            break;
+        case SETUP_UNO:
+            dispenseInProgress = true; // Reset flag for next dispensing
+            gameUno();
+            dispenseInProgress = false; // Mark dispensing as complete
+            currentState = DISPENSE_OVER;
+            break;
+        case SETUP_BlackJack:
+            dispenseInProgress = true; // Reset flag for next dispensing
+            gameBlackJack();
+            dispenseInProgress = false; // Mark dispensing as complete
+            currentState = DISPENSE_OVER;
+            break;
+        case SETUP_HoldEm:
+            dispenseInProgress = true; // Reset flag for next dispensing
+            gameHoldEm();
+            dispenseInProgress = false; // Mark dispensing as complete
+            currentState = DISPENSE_OVER;
+            break;
+        case DISPENSE_OVER:
+            for(;;){}; // Halt indefinitely after dispensing is complete
+            break;
+        default:
+            currentState = SET_UP_STARTUP;
+            break;
+    }
+}
+
+//-------------------------------------------------------------------------
+//Functions
+//-------------------------------------------------------------------------
+//Rotates card dispenser
+void moveStepMotor(bool clockwise){
+    digitalWrite(dirPin, clockwise ? HIGH : LOW);
+    for(unsigned long i = 0; i < stepsTotal; i++){
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(stepDelay);
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(stepDelay);
+    }
+}
+//Dispenses card
+void spitCard(){
+    for(int i = 0; i < cardDispense; i++){
+        digitalWrite(DCM1_FWD_Pin, HIGH);
+        analogWrite(DCM1_PWM_Pin, DCM_PWM_Spd);
+        delay(110);
+        digitalWrite(DCM2_FWD_Pin, HIGH);
+        analogWrite(DCM2_PWM_Pin, DCM_PWM_Spd);
+        delay(110);
+        digitalWrite(DCM3_FWD_Pin, HIGH);
+        analogWrite(DCM3_PWM_Pin, DCM_PWM_Spd);        
+        delay(msActiveMain);
+        digitalWrite(DCM1_FWD_Pin, LOW);
+        analogWrite(DCM1_PWM_Pin, 0);
+        delay(msActiveSecond);
+        digitalWrite(DCM2_FWD_Pin, LOW);
+        digitalWrite(DCM3_FWD_Pin, LOW);
+        analogWrite(DCM2_PWM_Pin, 0);
+        analogWrite(DCM3_PWM_Pin, 0);
+    }
+}
+//Calculates the amount of steps necessary per person
+void stepsPerPerson(int peopleCount){
+    if(peopleCount == 0){
+        stepsTotal = 0;
+        return;
+    }
+    float angle = 360.0/peopleCount;
+    stepsTotal = (unsigned long)(angle * 200.0 * scalingFactor) / 360.0;
+}
+//Reads the variables from the I2C
+void receiveEvent(int numBytes){
+    if(numBytes >= 2){
+        peopleCount = Wire.read();
+        gameMode = Wire.read();
+    }
+    while(Wire.available()){
+        Wire.read();
+    }
+    // This is the core test: print the received values
+    Serial.print("Rx: P=");
+    Serial.print(peopleCount);
+    Serial.print(", M=");
+    Serial.println(gameMode);
+    currentState = SET_UP_STARTUP;
+}
+//Sets Scaling Factor
+void setScalingFactor(int factor){
+    if(factor == 16){
+        digitalWrite(MS1_Pin, HIGH);
+        digitalWrite(MS2_Pin, HIGH);
+        digitalWrite(MS3_Pin, HIGH);
+    }
+    else if(factor == 8){
+        digitalWrite(MS1_Pin, HIGH);
+        digitalWrite(MS2_Pin, HIGH);
+        digitalWrite(MS3_Pin, LOW);
+    }
+    else if(factor == 4){
+        digitalWrite(MS1_Pin, LOW);
+        digitalWrite(MS2_Pin, HIGH);
+        digitalWrite(MS3_Pin, LOW);
+    }
+    else if(factor == 2){
+        digitalWrite(MS1_Pin, HIGH);
+        digitalWrite(MS2_Pin, LOW);
+        digitalWrite(MS3_Pin, LOW);
+    }
+    else{
+        digitalWrite(MS1_Pin, LOW);
+        digitalWrite(MS2_Pin, LOW);
+        digitalWrite(MS3_Pin, LOW);
+    }
+}
+//Reads Game Mode
+void gameModeSelected(){
+    if(gameMode == 1){
+        currentState = SETUP_UNO; //Set for playing UNO
+    } else if(gameMode == 2){
+        currentState = SETUP_BlackJack; //Set for BlackJack
+    } else {
+        currentState = SETUP_HoldEm; //Set for Texas Hold'em
+    }
+}
+//Sets up dispenser for UNO
+void gameUno(){
+    cardCount = 7;
+    cardDispense = 7;
+    for(int i = 0; i < peopleCount; i++){
+    spitCard();
+    moveStepMotor(clockwise);
+    }
+}
+//Sets up dispenser for BlackJack
+void gameBlackJack(){
+    cardCount = 2; 
+    cardDispense = 1;
+    for(int i = 0; i < cardCount; i++){
+        for(int j = 0; j < peopleCount; j++){
+            spitCard();
+            moveStepMotor(clockwise);
+        }
+    }
+}
+//Sets up dispenser for Texas Hold'em
+void gameHoldEm(){
+    cardCount = 2; //Sets to dispense 2 cards
+    cardDispense = 1;
+    for(int i = 0; i < cardCount; i++){
+        for(int j = 0; j < peopleCount; j++){
+            spitCard();
+            moveStepMotor(clockwise);
+        }
+    }
+    moveStepMotor(clockwise); //Rotates away from dealer
+    cardDispense = 1; //Burns a card
+    spitCard();       //Dispenses the burn card
+    delay(1000);     //Waits 1 second before continuing
+    moveStepMotor(!clockwise); //Rotate back to dealer
+    cardDispense = 3; //Sets to dispense 3 cards for the flop
+    spitCard();       //Dispenses the flop
+    delay(1000);     //Waits 1 second before continuing
+    moveStepMotor(clockwise); //Rotates away from dealer
+    cardDispense = 1; //Burns a card
+    spitCard();       //Dispenses the burn card
+    delay(1000);     //Waits 1 second before continuing
+    moveStepMotor(!clockwise); //Rotate back to dealer
+    spitCard();       //Dispenses the turn card
+    delay(1000);     //Waits 1 second before continuing
+    moveStepMotor(clockwise); //Rotates away from dealer
+    spitCard();       //Dispenses the burn card
+    delay(1000);     //Waits 1 second before continuing
+    moveStepMotor(!clockwise); //Rotate back to dealer
+    spitCard();       //Dispenses the river card
+}
